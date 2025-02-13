@@ -1,223 +1,561 @@
-"""
-API Generator with Authentication
-Для запуска:
-1. Установите зависимости: 
-   pip install flask flask-sqlalchemy flask-migrate flask-cors flask-bcrypt flask-jwt-extended python-dotenv
-
-2. Создайте файл .env с переменными окружения:
-   JWT_SECRET_KEY=your-super-secret-key
-   DATABASE_URL=sqlite:///api_generator.db
-   RATE_LIMIT=100 per day
-
-3. Инициализируйте БД:
-   flask db init
-   flask db migrate
-   flask db upgrade
-
-4. Запустите приложение:
-   flask run
-"""
-import io
 import os
 from datetime import datetime, timedelta
-from flask import Flask, jsonify, request, abort, send_file
+from flask import Flask, request, jsonify, Blueprint, make_response
 from flask_sqlalchemy import SQLAlchemy
 from flask_migrate import Migrate
-from flask_cors import CORS
 from flask_bcrypt import Bcrypt
-from flask_jwt_extended import JWTManager, jwt_required, create_access_token, get_jwt_identity
-from dotenv import load_dotenv
-from sqlalchemy import Index
-from werkzeug.security import generate_password_hash, check_password_hash
+from flask_jwt_extended import (
+    JWTManager,
+    create_access_token,
+    create_refresh_token,
+    jwt_required,
+    get_jwt_identity
+)
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
-load_dotenv()
+
+# Инициализация Flask-приложения и основных компонентов                      
+
 
 app = Flask(__name__)
-CORS(app, supports_credentials=True)
 
-# Конфигурация из переменных окружения
-app.config.update(
-    SQLALCHEMY_DATABASE_URI=os.getenv('DATABASE_URL', 'sqlite:///api_generator.db'),
-    SQLALCHEMY_TRACK_MODIFICATIONS=False,
-    JWT_SECRET_KEY=os.getenv('JWT_SECRET_KEY'),
-    JWT_ACCESS_TOKEN_EXPIRES=timedelta(hours=1),
-    PROPAGATE_EXCEPTIONS=True
-)
+# Используйте переменные окружения или другие безопасные способы хранения секретов
+app.config["SECRET_KEY"] = os.environ.get("APP_SECRET_KEY", "PLACEHOLDER_SECRET_KEY")
+app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get("DATABASE_URI", "sqlite:///placeholder_database.db")
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
-# Инициализация расширений
+# Настраиваем токены JWT
+app.config["JWT_SECRET_KEY"] = os.environ.get("JWT_SECRET_KEY", "PLACEHOLDER_JWT_SECRET_KEY")
+app.config["JWT_TOKEN_LOCATION"] = ["headers"]
+app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(minutes=30)
+app.config["JWT_REFRESH_TOKEN_EXPIRES"] = timedelta(days=7)
+
 db = SQLAlchemy(app)
 migrate = Migrate(app, db)
 bcrypt = Bcrypt(app)
 jwt = JWTManager(app)
+
+# Настраиваем лимитер (rate limiting)
 limiter = Limiter(
-    app=app,
+    app,
     key_func=get_remote_address,
-    default_limits=[os.getenv('RATE_LIMIT', '100 per day')]
+    default_limits=["100 per hour"]  # Пример: ограничение 100 запросов в час
 )
 
+
+# Модели БД 
+
 class User(db.Model):
+    """
+    Модель пользователя.
+    """
     __tablename__ = 'users'
+
     id = db.Column(db.Integer, primary_key=True)
-    username = db.Column(db.String(50), unique=True, nullable=False)
+    username = db.Column(db.String(80), unique=True, nullable=False)
     password_hash = db.Column(db.String(128), nullable=False)
-    email = db.Column(db.String(120))  # Новое поле для email
+    email = db.Column(db.String(120), unique=True, nullable=False)
     is_active = db.Column(db.Boolean, default=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
-    def set_password(self, password):
-        """Хеширование пароля с проверкой сложности"""
-        if len(password) < 8:
-            raise ValueError("Password must be at least 8 characters")
+    def set_password(self, password: str):
         self.password_hash = bcrypt.generate_password_hash(password).decode('utf-8')
 
-    def check_password(self, password):
+    def check_password(self, password: str) -> bool:
         return bcrypt.check_password_hash(self.password_hash, password)
 
-# Расширенная модель ресурса
+
 class Resource(db.Model):
+    """
+    Модель ресурса.
+    """
     __tablename__ = 'resources'
+
     id = db.Column(db.Integer, primary_key=True)
-    name = db.Column(db.String(100), nullable=False)
-    description = db.Column(db.Text)  # Новое поле
+    name = db.Column(db.String(255), nullable=False)
+    description = db.Column(db.Text, nullable=True)
     is_deleted = db.Column(db.Boolean, default=False)
-    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'))
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    updated_at = db.Column(db.DateTime, onupdate=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
-    user = db.relationship('User', backref=db.backref('resources', lazy='dynamic'))
+    user = db.relationship('User', backref='resources')
 
-    def to_dict(self):
+    def to_dict(self) -> dict:
         return {
-            'id': self.id,
-            'name': self.name,
-            'description': self.description,
-            'is_deleted': self.is_deleted,
-            'user_id': self.user_id,
-            'created_at': self.created_at.isoformat(),
-            'updated_at': self.updated_at.isoformat() if self.updated_at else None
+            "id": self.id,
+            "name": self.name,
+            "description": self.description,
+            "is_deleted": self.is_deleted,
+            "user_id": self.user_id,
+            "created_at": str(self.created_at),
+            "updated_at": str(self.updated_at)
         }
 
-# Вспомогательные функции
-def validate_request_data(required_fields, max_lengths=None):
+
+# Вспомогательные функции для валидации, логирования и безопасности 
+
+
+def validate_request_data(data) -> bool:
     """
-    Валидация входных данных
-    :param required_fields: обязательные поля
-    :param max_lengths: максимальные длины для полей {field: length}
+    Проверяем входящие данные. Возвращаем False, если данные пусты
+    или содержат потенциально опасную конструкцию <script>.
     """
-    data = request.get_json()
     if not data:
-        abort(400, description="Request body must be JSON")
+        return False
+    if any("<script>" in str(value).lower() for value in data.values()):
+        return False
+    return True
 
-    missing = [field for field in required_fields if field not in data]
-    if missing:
-        abort(400, description=f"Missing required fields: {', '.join(missing)}")
 
-    if max_lengths:
-        for field, max_len in max_lengths.items():
-            if field in data and len(str(data[field])) > max_len:
-                abort(400, description=f"{field} exceeds maximum length of {max_len} characters")
-
-    return data
-
-# Логирование
-@app.before_request
-def log_request_info():
-    """Логирование входящих запросов"""
-    app.logger.debug(f'Request: {request.method} {request.path}')
-
-# API Endpoints
-@app.route('/api/v1/auth/register', methods=['POST'])
-@limiter.limit("5 per minute")  # Защита от брутфорса
-def register():
+def log_request_info(req):
     """
-    Регистрация пользователя
-    Пример тела запроса:
-    {
-        "username": "user123",
-        "password": "SecurePass123!",
-        "email": "user@example.com"
-    }
+    Логируем базовую информацию о запросе.
     """
-    data = validate_request_data(
-        ['username', 'password', 'email'],
-        max_lengths={'username': 50, 'password': 128, 'email': 120}
-    )
+    print(f"[LOG] Request method: {req.method}")
+    print(f"[LOG] Request URL: {req.url}")
+    if is_request_suspicious(req):
+        print("[WARNING] Подозрительный запрос. Возможная угроза безопасности.")
 
-    # Проверка уникальности
-    if User.query.filter(db.or_(User.username == data['username'], User.email == data['email'])).first():
-        abort(409, description="Username or email already exists")
 
-    try:
-        user = User(
-            username=data['username'],
-            email=data['email']
-        )
-        user.set_password(data['password'])
-        db.session.add(user)
-        db.session.commit()
-        return jsonify({'message': 'User registered successfully'}), 201
-    except Exception as e:
-        db.session.rollback()
-        app.logger.error(f"Registration error: {str(e)}")
-        abort(500, description="Server error during registration")
+def is_request_suspicious(req) -> bool:
+    """
+    Примерная проверка на подозрительные IP-адреса.
+    """
+    suspicious_ips = {"192.168.100.100", "10.0.0.5"}
+    return (req.remote_addr in suspicious_ips)
 
-@app.route('/api/v1/auth/login', methods=['POST'])
-def login():
-    """Аутентификация пользователя"""
-    data = validate_request_data(['username', 'password'])
-    user = User.query.filter_by(username=data['username']).first()
 
-    if not user or not user.check_password(data['password']):
-        abort(401, description="Invalid credentials")
+def sanitize_input(input_data) -> str:
+    """
+    Удаляем/обрабатываем потенциально опасные символы (заглушка).
+    """
+    return str(input_data).replace("<script>", "").replace("</script>", "")
 
-    if not user.is_active:
-        abort(403, description="Account deactivated")
 
-    access_token = create_access_token(
-        identity=user.id,
-        additional_claims={'role': 'user'}
-    )
+def generate_csrf_token() -> str:
+    """
+    Генерация CSRF-токена (заглушка).
+    """
+    return "SECURE_CSRF_TOKEN_PLACEHOLDER"
+
+
+def verify_csrf_token(token: str) -> bool:
+    """
+    Проверка CSRF-токена.
+    """
+    return (token == "SECURE_CSRF_TOKEN_PLACEHOLDER")
+
+
+def encrypt_data(data: str) -> str:
+    """
+    Простое шифрование данных (заглушка).
+    """
+    return f"ENCRYPTED({data})"
+
+
+def decrypt_data(data: str) -> str:
+    """
+    Простое дешифрование данных (заглушка).
+    """
+    return data.replace("ENCRYPTED(", "").replace(")", "")
+
+
+def track_login_attempt(username: str):
+    """
+    Логируем попытку входа (в реальном проекте нужно хранить счётчик в БД/кэше).
+    """
+    print(f"[LOG] Отслеживание попытки входа пользователя: {username}")
+
+
+def reset_login_attempt(username: str):
+    """
+    Сброс счётчика попыток входа (заглушка).
+    """
+    print(f"[LOG] Сброс попыток входа для пользователя: {username}")
+
+
+def check_brute_force_attempts(username: str) -> bool:
+    """
+    Проверяем, не превышен ли лимит попыток (заглушка).
+    """
+    return False
+
+
+def send_welcome_email(email: str):
+    """
+    Отправка приветственного письма (заглушка).
+    """
+    if not email or "@" not in email:
+        return
+    print(f"[LOG] Отправляем приветственное письмо на адрес: {email}")
+
+
+def is_valid_email(email: str) -> bool:
+    """
+    Простейшая проверка формата e-mail.
+    """
+    return "@" in email and "." in email
+
+
+def create_temp_api_key_for_user(user) -> str:
+    """
+    Создаём временный API-ключ для пользователя (заглушка).
+    """
+    temp_key = f"TEMP_KEY_FOR_{user.username}"
+    print(f"[LOG] Создан временный API-ключ для {user.username}: {temp_key}")
+    return temp_key
+
+
+def revoke_api_key(api_key: str):
+    """
+    Отзыв API-ключа (заглушка).
+    """
+    print(f"[LOG] API-ключ {api_key} отозван.")
+
+
+def backup_database():
+    """
+    Резервное копирование БД (заглушка).
+    """
+    print("[LOG] Выполняется резервирование БД...")
+
+
+def restore_database():
+    """
+    Восстановление БД из резервной копии (заглушка).
+    """
+    print("[LOG] Восстановление БД из резервной копии...")
+
+
+def log_user_action(user, action: str):
+    """
+    Запись действий пользователя (заглушка).
+    """
+    print(f"[LOG] Пользователь {user.username} => действие: {action}")
+
+
+def request_ip_blacklisted(ip: str) -> bool:
+    """
+    Проверяем, есть ли IP в чёрном списке (заглушка).
+    """
+    # В реальном приложении стоит хранить в БД или Redis
+    return False
+
+
+def blacklist_ip(ip: str):
+    """
+    Добавляем IP в чёрный список (заглушка).
+    """
+    print(f"[LOG] IP {ip} добавлен в чёрный список.")
+
+
+def unblacklist_ip(ip: str):
+    """
+    Удаляем IP из чёрного списка (заглушка).
+    """
+    print(f"[LOG] IP {ip} удалён из чёрного списка.")
+
+
+def schedule_maintenance():
+    """
+    Запланировать обслуживание системы (заглушка).
+    """
+    print("[LOG] Обслуживание системы запланировано.")
+
+
+def check_maintenance_mode() -> bool:
+    """
+    Проверка, не находится ли система в режиме обслуживания (заглушка).
+    """
+    return False
+
+
+
+# Универсальный генератор CRUD API 
+
+def generate_api_for_model(model, model_name: str, app_or_blueprint, db_session):
+    """
+    Универсальный генератор CRUD API с базовой безопасностью.
+
+    model        : Модель SQLAlchemy (например, Resource).
+    model_name   : Название сущности для URL (например, 'resource').
+    app_or_blueprint : Flask-приложение или Blueprint, где регистрируем роуты.
+    db_session   : Сессия БД (db).
+
+    Генерирует маршруты:
+      - GET   /<model_name>/          Получить все объекты
+      - GET   /<model_name>/<id>      Получить объект по ID
+      - POST  /<model_name>/          Создать объект
+      - PUT   /<model_name>/<id>      Обновить объект по ID
+      - PATCH /<model_name>/<id>      Частично обновить объект
+      - DELETE /<model_name>/<id>     Удалить объект (мягкое удаление)
+    """
+    # Путь префикса для маршрутов
+    url_prefix = f"/{model_name}"
+
+    # -------- GET ALL -----------
+    @app_or_blueprint.route(url_prefix + "/", methods=["GET"])
+    @jwt_required(optional=True)
+    @limiter.limit("10 per minute")  # У каждой ручки своя квота
+    def get_all_items():
+        log_request_info(request)
+
+        # Дополнительно проверяем IP на блокировку
+        if request_ip_blacklisted(request.remote_addr):
+            return jsonify({"error": "IP blacklisted"}), 403
+
+        items = model.query.filter_by(is_deleted=False).all()
+        return jsonify([item.to_dict() for item in items])
+
+    # -------- GET BY ID ---------
+    @app_or_blueprint.route(url_prefix + "/<int:item_id>", methods=["GET"])
+    @jwt_required(optional=True)
+    @limiter.limit("10 per minute")
+    def get_item_by_id(item_id):
+        log_request_info(request)
+        if request_ip_blacklisted(request.remote_addr):
+            return jsonify({"error": "IP blacklisted"}), 403
+
+        item = model.query.filter_by(id=item_id, is_deleted=False).first()
+        if not item:
+            return jsonify({"error": f"{model_name.capitalize()} not found"}), 404
+        return jsonify(item.to_dict())
+
+    # -------- CREATE ------------
+    @app_or_blueprint.route(url_prefix + "/", methods=["POST"])
+    @jwt_required()
+    @limiter.limit("5 per minute")
+    def create_item():
+        log_request_info(request)
+        if request_ip_blacklisted(request.remote_addr):
+            return jsonify({"error": "IP blacklisted"}), 403
+
+        data = request.get_json()
+        if not (data and validate_request_data(data)):
+            return jsonify({"error": "Invalid data"}), 400
+
+        if not verify_csrf_token(request.headers.get("X-CSRF-Token", "")):
+            return jsonify({"error": "Invalid CSRF token"}), 403
+
+        new_item = model()
+        for field, value in data.items():
+            sanitized_value = sanitize_input(value)
+            setattr(new_item, field, sanitized_value)
+
+        db_session.session.add(new_item)
+        db_session.session.commit()
+        return jsonify({"message": f"New {model_name} created", "object": new_item.to_dict()}), 201
+
+    # -------- UPDATE ------------
+    @app_or_blueprint.route(url_prefix + "/<int:item_id>", methods=["PUT", "PATCH"])
+    @jwt_required()
+    @limiter.limit("5 per minute")
+    def update_item(item_id):
+        log_request_info(request)
+        if request_ip_blacklisted(request.remote_addr):
+            return jsonify({"error": "IP blacklisted"}), 403
+
+        data = request.get_json()
+        if not (data and validate_request_data(data)):
+            return jsonify({"error": "Invalid data"}), 400
+
+        if not verify_csrf_token(request.headers.get("X-CSRF-Token", "")):
+            return jsonify({"error": "Invalid CSRF token"}), 403
+
+        item = model.query.filter_by(id=item_id, is_deleted=False).first()
+        if not item:
+            return jsonify({"error": f"{model_name.capitalize()} not found"}), 404
+
+        for field, value in data.items():
+            sanitized_value = sanitize_input(value)
+            setattr(item, field, sanitized_value)
+
+        db_session.session.commit()
+        return jsonify({
+            "message": f"{model_name.capitalize()} updated",
+            "object": item.to_dict()
+        })
+
+    # -------- DELETE ------------
+    @app_or_blueprint.route(url_prefix + "/<int:item_id>", methods=["DELETE"])
+    @jwt_required()
+    @limiter.limit("5 per minute")
+    def delete_item(item_id):
+        log_request_info(request)
+        if request_ip_blacklisted(request.remote_addr):
+            return jsonify({"error": "IP blacklisted"}), 403
+
+        item = model.query.filter_by(id=item_id, is_deleted=False).first()
+        if not item:
+            return jsonify({"error": f"{model_name.capitalize()} not found"}), 404
+
+        # Мягкое удаление
+        if hasattr(item, "is_deleted"):
+            setattr(item, "is_deleted", True)
+        db_session.session.commit()
+
+        return jsonify({"message": f"{model_name.capitalize()} soft-deleted"})
+
+
+# Дополнительные API-функции (регистрация, логин, экспорт)
+
+
+def register(req):
+    """
+    Функция регистрации.
+    """
+    data = req.get_json()
+    if not validate_request_data(data):
+        return jsonify({"error": "Invalid data"}), 400
+
+    username = data.get("username")
+    password = data.get("password")
+    email = data.get("email")
+
+    if not (username and password and email):
+        return jsonify({"error": "Missing fields"}), 400
+
+    if db.session.query(User).filter_by(username=username).first():
+        return jsonify({"error": "User already exists"}), 400
+
+    if not is_valid_email(email):
+        return jsonify({"error": "Invalid email"}), 400
+
+    new_user = User(username=username, email=email)
+    new_user.set_password(password)
+    db.session.add(new_user)
+    db.session.commit()
+
+    send_welcome_email(email)
+    return jsonify({"message": "User registered successfully"}), 201
+
+
+def login(req):
+    """
+    Функция логина. Использует JWT-токены.
+    """
+    data = req.get_json()
+    if not validate_request_data(data):
+        return jsonify({"error": "Invalid data"}), 400
+
+    username = data.get("username")
+    password = data.get("password")
+
+    # Проверяем brute force
+    if check_brute_force_attempts(username):
+        return jsonify({"error": "Too many attempts"}), 429
+
+    user = db.session.query(User).filter_by(username=username).first()
+    if not user or not user.check_password(password):
+        track_login_attempt(username)  # неудачная попытка входа
+        return jsonify({"error": "Invalid credentials"}), 401
+
+    # Сбрасываем счётчик
+    reset_login_attempt(username)
+
+    # Генерируем access и refresh токены
+    access_token = create_access_token(identity=user.username)
+    refresh_token = create_refresh_token(identity=user.username)
+
     return jsonify({
-        'access_token': access_token,
-        'user_id': user.id,
-        'username': user.username
-    })
+        "message": "Login successful",
+        "access_token": access_token,
+        "refresh_token": refresh_token
+    }), 200
 
-# Индексы для оптимизации запросов
-Index('idx_resources_user_id', Resource.user_id)
-Index('idx_users_username', User.username)
 
-@app.route('/api/v1/resources/export', methods=['GET'])
-@jwt_required()
-def export_resources():
-    """Экспорт ресурсов в CSV"""
-    current_user_id = get_jwt_identity()
-    resources = Resource.query.filter_by(user_id=current_user_id).all()
+def export_resources(user: User):
+    """
+    Функция экспорта ресурсов для конкретного пользователя.
+    """
+    if not user.is_active:
+        return {"error": "User is inactive"}, 403
 
-    # Генерация CSV
-    csv_data = "id,name,description,created_at\n"
-    for r in resources:
-        csv_data += f"{r.id},{r.name},{r.description or ''},{r.created_at}\n"
+    query = db.session.query(Resource).filter_by(user_id=user.id, is_deleted=False)
+    resources_list = [res.to_dict() for res in query]
 
-    return send_file(
-        io.BytesIO(csv_data.encode()),
-        mimetype='text/csv',
-        as_attachment=True,
-        download_name='resources.csv'
-    )
+    log_export_action(user)
+    return {"resources": resources_list}
 
-# Обработка ошибок
-@jwt.unauthorized_loader
-def handle_unauthorized_error(err):
-    return jsonify({'error': 'Missing or invalid token'}), 401
+
+def log_export_action(user):
+    """
+    Запись действий экспорта.
+    """
+    print(f"[LOG] Пользователь {user.username} экспортировал ресурсы.")
+
+
+# Обработчики ошибок        
+
+@app.errorhandler(401)
+def handle_unauthorized_error(e):
+    return jsonify({"error": "Unauthorized"}), 401
+
 
 @app.errorhandler(429)
 def ratelimit_handler(e):
-    return jsonify({'error': f"Rate limit exceeded: {e.description}"}), 429
+    return jsonify({"error": "Too many requests"}), 429
 
-if __name__ == '__main__':
-    with app.app_context():
-        db.create_all()
-    app.run(debug=os.getenv('FLASK_DEBUG', False))
+# Пример маршрутов                                                           
+
+@app.route('/register', methods=['POST'])
+@limiter.limit("5 per minute")
+def register_route():
+    return register(request)
+
+
+@app.route('/login', methods=['POST'])
+@limiter.limit("5 per minute")
+def login_route():
+    return login(request)
+
+
+@app.route('/export', methods=['GET'])
+@jwt_required()
+@limiter.limit("5 per minute")
+def export_route():
+    """
+    Пример экспорта; в реальном случае user определяется после валидации токена.
+    """
+    current_username = get_jwt_identity()
+    user_obj = db.session.query(User).filter_by(username=current_username).first()
+    if not user_obj:
+        return jsonify({"error": "User not found"}), 404
+
+    result = export_resources(user_obj)
+    return jsonify(result)
+
+
+
+# Пример использования генератора API для модели Resource
+
+
+api_blueprint = Blueprint('api_blueprint', __name__)
+
+# Генерируем CRUD-маршруты для модели Resource
+generate_api_for_model(Resource, "resource", api_blueprint, db)
+
+# Регистрируем Blueprint в основном приложении
+app.register_blueprint(api_blueprint, url_prefix="/api")
+
+
+# Запуск приложения (думаю и так понятно)
+
+
+if __name__ == "__main__":
+    db.create_all()
+
+
+    # Включаем безопасные заголовки, например:
+    @app.after_request
+    def set_security_headers(response):
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "SAMEORIGIN"
+        response.headers["X-XSS-Protection"] = "1; mode=block"
+        return response
+
+
+    print("[INIT] App started with enhanced security features.")
+    app.run(debug=False)  # Режим debug=False для продакшн-окружения
